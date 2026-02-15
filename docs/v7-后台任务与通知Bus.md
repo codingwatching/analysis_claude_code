@@ -130,12 +130,14 @@ TaskStop(task_id="a3f7c2")
 # 1. 排空：从队列中拉取所有待处理通知
 notifications = BG.drain_notifications()
 
-# 2. 格式化：转换为 XML 块
+# 2. 格式化：转换为 XML 块（共 6 个标签）
 notif_text = "\n".join(
     f"<task-notification>\n"
     f"  <task-id>{n['task_id']}</task-id>\n"
+    f"  <task-type>{n.get('task_type', 'unknown')}</task-type>\n"
     f"  <status>{n['status']}</status>\n"
-    f"  Summary: {n['summary']}\n"
+    f"  <summary>{n['summary']}</summary>\n"
+    f"  <output-file>{n.get('output_file', '')}</output-file>\n"
     f"</task-notification>"
     for n in notifications
 )
@@ -149,19 +151,57 @@ else:
 
 模型将通知视为会话上下文中的结构化 XML 块，然后决定是通过 `TaskOutput` 获取完整输出还是基于摘要继续工作。
 
-## 通知格式
+## 通知 XML 协议
 
-后台任务完成时，通知自动注入主 Agent 的下一轮对话：
+后台任务完成时，通知自动注入主 Agent 的下一轮对话。XML 包含 6 个标签：
 
 ```xml
 <task-notification>
   <task-id>a3f7c2</task-id>
+  <task-type>local_agent</task-type>
   <status>completed</status>
-  Summary: Found 3 authentication-related files in src/auth/...
+  <summary>Found 3 authentication-related files in src/auth/...</summary>
+  <output-file>.task_outputs/a3f7c2.txt</output-file>
 </task-notification>
 ```
 
-`summary` 字段包含任务输出的前 500 个字符——足够模型判断是否需要获取完整结果。
+| 标签 | 用途 |
+|------|------|
+| `task-notification` | 包裹元素 |
+| `task-id` | 带类型前缀的唯一 ID (b/a/t) |
+| `task-type` | `local_bash`、`local_agent` 或 `in_process_teammate` |
+| `status` | `completed`、`error` 或 `stopped` |
+| `summary` | 输出前 500 个字符，用于快速判断 |
+| `output-file` | 完整输出在磁盘上的路径 |
+
+## 不可编辑队列模式
+
+通知 XML 块被标记为不可编辑：
+
+```python
+NON_EDITABLE_MODES = {"task-notification"}
+
+def is_editable(mode: str) -> bool:
+    return mode not in NON_EDITABLE_MODES
+```
+
+这防止模型尝试修改注入的通知文本。通知是只读的结构化数据，不属于可编辑的对话流。
+
+## 输出文件系统
+
+后台任务的输出保存到磁盘 `.task_outputs/{task_id}.txt`：
+
+```python
+OUTPUT_DIR = WORKDIR / ".task_outputs"
+
+def _save_output(self, task_id, output):
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    (OUTPUT_DIR / f"{task_id}.txt").write_text(output)
+```
+
+这有两个目的：
+1. 大型输出不会膨胀通知（只注入 500 字符的摘要）
+2. 输出持久化在磁盘上，即使上下文被压缩也不会丢失
 
 ## 典型流程
 
@@ -208,4 +248,4 @@ v6 的 Tasks 是看板——记录要做什么。v7 的后台任务是流水线�
 
 **串行等待浪费时间，并行通知解放效率。**
 
-[<< v6](./v6-Tasks系统.md) | [返回 README](../README_zh.md) | [v8 >>](./v8-Teammate机制.md)
+[<< v6](./v6-Tasks系统.md) | [返回 README](../README_zh.md) | [v8 >>](./v8-团队通信.md)

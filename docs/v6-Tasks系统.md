@@ -33,7 +33,7 @@ v5 的压缩会清除内存中的 todo。子代理之间无法共享任务。Tas
 ```python
 @dataclass
 class Task:
-    id: str              # 自增 ID
+    id: str              # 自增 ID（高水位线）
     subject: str         # 祈使句标题: "Fix auth bug"
     description: str     # 详细描述
     status: str = "pending"  # pending | in_progress | completed
@@ -41,6 +41,7 @@ class Task:
     owner: str = ""          # 负责的代理
     blocks: list = []        # 被此任务阻塞的任务
     blocked_by: list = []    # 阻塞此任务的前置任务
+    metadata: dict = {}      # 任意键值对
 ```
 
 为什么每个字段都需要：
@@ -51,6 +52,51 @@ class Task:
 | `owner` | 多代理时标识谁在做 |
 | `blocks/blockedBy` | 任务编排的依赖图 |
 | `description` | 另一个代理也能理解任务 |
+| `metadata` | 可扩展的键值数据 |
+
+## 任务状态机
+
+```
++--------+     update(status)     +-------------+     update(status)     +-----------+
+| pending| ------------------->   | in_progress | ------------------->   | completed |
++--------+                        +-------------+                        +-----------+
+    ^                                    |
+    |          update(status)            |
+    +------------------------------------+
+                  (重新打开)
+
+  任何状态 ---> deleted (永久删除)
+```
+
+当任务转为 `completed` 时，依赖它的任务的 `blocked_by` 列表会自动更新。
+
+## 高水位线 ID 分配
+
+任务 ID 通过高水位线文件（`.highwatermark`）分配，而不是扫描现有任务文件：
+
+```python
+HIGHWATERMARK_FILE = ".highwatermark"
+
+def _next_id(self):
+    """获取下一个任务 ID 并持久化高水位线"""
+    with self._lock:
+        self._highwatermark += 1
+        (self.tasks_dir / HIGHWATERMARK_FILE).write_text(str(self._highwatermark))
+        return str(self._highwatermark)
+```
+
+这防止了任务被删除后 ID 被重用。启动时从文件加载高水位线，如果文件不存在则回退到扫描现有任务文件。
+
+## 状态变更时自动分配 Owner
+
+当任务转入 `in_progress` 且没有 owner 时，代理自动将自己设为 owner：
+
+```python
+if kwargs.get("status") == "in_progress" and not task.owner:
+    task.owner = kwargs.get("owner", os.getenv("CLAUDE_AGENT_NAME", "agent"))
+```
+
+这省去了模型每次开始任务时显式设置 `owner` 的步骤。
 
 ## 四个工具
 

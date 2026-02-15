@@ -36,7 +36,8 @@
 - **上下文压缩** - 让 Agent 突破上下文窗口限制持续工作
 - **任务系统** - 从个人便签到团队看板
 - **并行执行** - 后台任务与通知驱动的工作流
-- **多 Agent 协作** - 持久化队友并行工作
+- **团队通信** - 持久化队友通过邮箱通信
+- **自治团队** - 自组织 Agent 自主认领和完成工作
 
 ## 学习路径
 
@@ -48,28 +49,31 @@
     |                    16-196 行
     v
 [v1: Basic Agent] ----> "完整的 Agent 模式"
-    |                    4 个工具，~420 行
+    |                    4 个工具，~417 行
     v
 [v2: Todo Agent] -----> "让计划显式化"
-    |                    +TodoManager，~530 行
+    |                    +TodoManager，~531 行
     v
 [v3: Subagent] -------> "分而治之"
-    |                    +Task 工具，~620 行
+    |                    +Task 工具，~623 行
     v
 [v4: Skills Agent] ---> "按需领域专业"
-    |                    +Skill 工具，~780 行
+    |                    +Skill 工具，~783 行
     v
 [v5: Compression] ----> "永不遗忘，永续工作"
-    |                    +ContextManager，~800 行
+    |                    +ContextManager，~896 行
     v
 [v6: Tasks Agent] ----> "从便利贴到看板"
-    |                    +TaskManager，~890 行
+    |                    +TaskManager，~957 行
     v
 [v7: Background] -----> "不等结果，继续干活"
-    |                    +BackgroundManager，~960 行
+    |                    +BackgroundManager，~1022 行
     v
-[v8: Teammate] -------> "一群 Agent 无所不能"
-                         +TeammateManager，~1330 行
+[v8: Team Agent] -----> "团队通信"
+    |                    +TeammateManager，~1402 行
+    v
+[v9: Autonomous] -----> "自治团队"
+                         +空闲循环，~1506 行
 ```
 
 **推荐学习方式：**
@@ -81,7 +85,8 @@
 6. 学习 v5 的上下文管理与压缩
 7. 探索 v6 的持久化任务追踪
 8. 理解 v7 的并行后台执行
-9. 掌握 v8 的多 Agent 团队协作
+9. 学习 v8 的团队生命周期与消息通信
+10. 掌握 v9 的自治多 Agent 协作
 
 ## 快速开始
 
@@ -106,7 +111,8 @@ python v4_skills_agent.py       # + Skills
 python v5_compression_agent.py  # + 上下文压缩
 python v6_tasks_agent.py        # + 任务系统
 python v7_background_agent.py   # + 后台任务
-python v8_teammate_agent.py     # + 团队协作
+python v8_team_agent.py         # + 团队通信
+python v9_autonomous_agent.py  # + 自治团队
 ```
 
 ## 核心模式
@@ -129,14 +135,15 @@ while True:
 | 版本 | 行数 | 工具 | 核心新增 | 关键洞察 |
 |------|------|------|---------|---------|
 | [v0](./v0_bash_agent.py) | ~196 | bash | 递归子代理 | 一个工具就够了 |
-| [v1](./v1_basic_agent.py) | ~420 | bash, read, write, edit | 核心循环 | 模型即代理 |
-| [v2](./v2_todo_agent.py) | ~530 | +TodoWrite | 显式规划 | 约束赋能复杂性 |
-| [v3](./v3_subagent.py) | ~620 | +Task | 上下文隔离 | 干净上下文 = 更好结果 |
-| [v4](./v4_skills_agent.py) | ~780 | +Skill | 知识加载 | 专业无需重训 |
-| [v5](./v5_compression_agent.py) | ~800 | +ContextManager | 三层压缩 | 遗忘成就无限工作 |
-| [v6](./v6_tasks_agent.py) | ~890 | +TaskCreate/Get/Update/List | 持久化任务 | 便利贴到看板 |
-| [v7](./v7_background_agent.py) | ~960 | +TaskOutput/TaskStop | 后台执行 | 串行到并行 |
-| [v8](./v8_teammate_agent.py) | ~1330 | +TeamCreate/SendMessage/TeamDelete | 持久化队友 | 指令到协作 |
+| [v1](./v1_basic_agent.py) | ~417 | bash, read, write, edit | 核心循环 | 模型即代理 |
+| [v2](./v2_todo_agent.py) | ~531 | +TodoWrite | 显式规划 | 约束赋能复杂性 |
+| [v3](./v3_subagent.py) | ~623 | +Task | 上下文隔离 | 干净上下文 = 更好结果 |
+| [v4](./v4_skills_agent.py) | ~783 | +Skill | 知识加载 | 专业无需重训 |
+| [v5](./v5_compression_agent.py) | ~896 | +ContextManager | 三层压缩 | 遗忘成就无限工作 |
+| [v6](./v6_tasks_agent.py) | ~957 | +TaskCreate/Get/Update/List | 持久化任务 | 便利贴到看板 |
+| [v7](./v7_background_agent.py) | ~1022 | +TaskOutput/TaskStop | 后台执行 | 串行到并行 |
+| [v8](./v8_team_agent.py) | ~1402 | +TeamCreate/SendMessage/TeamDelete | 团队通信 | 命令到协作 |
+| [v9](./v9_autonomous_agent.py) | ~1506 | +空闲循环/自动认领 | 自治团队 | 协作到自组织 |
 
 ## 子机制导航
 
@@ -160,31 +167,33 @@ while True:
 | **ID 前缀约定** | v7 | `_PREFIXES` | `b`=bash, `a`=agent（v8 增加 `t`=teammate） |
 | **通知总线** | v7 | `drain_notifications()` | 每次 API 调用前清空队列 |
 | **通知注入** | v7 | `<task-notification>` XML | 注入到最后一条用户消息 |
-| **Teammate 生命周期** | v8 | `_teammate_loop()` | active -> 工作 -> idle -> 检查邮箱 -> active |
+| **Teammate 生命周期** | v8 | `_teammate_loop()` | active -> 工作 -> 检查邮箱 -> 退出 |
 | **文件邮箱** | v8 | `send_message()/check_inbox()` | JSONL 格式，每个 Teammate 独立文件 |
 | **消息协议** | v8 | `MESSAGE_TYPES` | 5 种：message, broadcast, shutdown_req/resp, plan_approval |
 | **工具权限** | v8 | `TEAMMATE_TOOLS` | Teammate 获得 8 个工具（无 TeamCreate/Delete） |
-| **任务认领** | v8 | `teammate_loop` | 空闲 Teammate 自动认领未分配任务 |
-| **身份保持** | v8 | `auto_compact` + identity | 压缩后重新注入 Teammate 名称/角色 |
+| **空闲循环** | v9 | `_teammate_loop()` | active -> idle -> 轮询邮箱 -> 唤醒 -> active |
+| **任务认领** | v9 | `_teammate_loop()` | 空闲 Teammate 自动认领未分配任务 |
+| **身份保持** | v9 | `auto_compact` + identity | 压缩后重新注入 Teammate 名称/角色 |
 
 ## 文件结构
 
 ```
 learn-claude-code/
-├── v0_bash_agent.py       # ~50 行: 1 个工具，递归子代理
-├── v0_bash_agent_mini.py  # ~16 行: 极限压缩
-├── v1_basic_agent.py      # ~200 行: 4 个工具，核心循环
-├── v2_todo_agent.py       # ~300 行: + TodoManager
-├── v3_subagent.py         # ~450 行: + Task 工具，代理注册表
-├── v4_skills_agent.py     # ~550 行: + Skill 工具，SkillLoader
-├── v5_compression_agent.py # ~650 行: + ContextManager，三层压缩
-├── v6_tasks_agent.py      # ~750 行: + TaskManager，依赖图 CRUD
-├── v7_background_agent.py # ~850 行: + BackgroundManager，并行执行
-├── v8_teammate_agent.py   # ~1000 行: + TeammateManager，团队协作
-├── skills/                # 示例 Skills（pdf, code-review, mcp-builder, agent-builder）
-├── docs/                  # 技术文档（中英日三语）
-├── articles/              # 公众号风格文章
-└── tests/                 # 单元测试、特性测试和集成测试
+|-- v0_bash_agent.py       # ~196 行: 1 个工具，递归子代理
+|-- v0_bash_agent_mini.py  # ~16 行: 极限压缩
+|-- v1_basic_agent.py      # ~417 行: 4 个工具，核心循环
+|-- v2_todo_agent.py       # ~531 行: + TodoManager
+|-- v3_subagent.py         # ~623 行: + Task 工具，代理注册表
+|-- v4_skills_agent.py     # ~783 行: + Skill 工具，SkillLoader
+|-- v5_compression_agent.py # ~896 行: + ContextManager，三层压缩
+|-- v6_tasks_agent.py      # ~957 行: + TaskManager，依赖图 CRUD
+|-- v7_background_agent.py # ~1022 行: + BackgroundManager，并行执行
+|-- v8_team_agent.py       # ~1402 行: + TeammateManager，团队通信
+|-- v9_autonomous_agent.py # ~1506 行: + 空闲循环，自动认领，身份保持
+|-- skills/                # 示例 Skills（pdf, code-review, mcp-builder, agent-builder）
+|-- docs/                  # 技术文档（中英日三语）
+|-- articles/              # 公众号风格文章
++-- tests/                 # 单元测试、特性测试和集成测试
 ```
 
 ## 深入阅读
@@ -199,7 +208,8 @@ learn-claude-code/
 - [v5: 上下文压缩](./docs/v5-上下文压缩.md)
 - [v6: Tasks 系统](./docs/v6-Tasks系统.md)
 - [v7: 后台任务与通知 Bus](./docs/v7-后台任务与通知Bus.md)
-- [v8: Teammate 机制](./docs/v8-Teammate机制.md)
+- [v8: 团队通信](./docs/v8-团队通信.md)
+- [v9: 自治团队](./docs/v9-自治团队.md)
 
 ### 原创文章 (articles/)
 
@@ -211,7 +221,8 @@ learn-claude-code/
 - [v5文章](./articles/v5文章.md) - 三层上下文压缩
 - [v6文章](./articles/v6文章.md) - Tasks 系统
 - [v7文章](./articles/v7文章.md) - 后台任务与通知 Bus
-- [v8文章](./articles/v8文章.md) - Teammate 机制
+- [v8文章](./articles/v8文章.md) - 团队通信
+- [v9文章](./articles/v9文章.md) - 自治团队
 - [上下文缓存经济学](./articles/上下文缓存经济学.md) - Agent 开发者必知的成本优化
 
 ## 使用 Skills 系统

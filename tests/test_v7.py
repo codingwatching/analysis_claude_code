@@ -387,6 +387,78 @@ def test_v7_bash_run_in_background_schema():
 
 
 # =============================================================================
+# v7 New Mechanism Tests (from final_design.md)
+# =============================================================================
+
+
+def test_non_editable_queue_mode():
+    """Verify 'task-notification' mode items are non-editable."""
+    from v7_background_agent import is_editable, NON_EDITABLE_MODES
+    assert not is_editable("task-notification"), \
+        "task-notification should NOT be editable"
+    assert "task-notification" in NON_EDITABLE_MODES
+    print("PASS: test_non_editable_queue_mode")
+    return True
+
+
+def test_editable_queue_mode():
+    """Verify 'user-input' mode items are editable."""
+    from v7_background_agent import is_editable
+    assert is_editable("user-input"), "user-input should be editable"
+    assert is_editable("custom-mode"), "Custom modes should be editable by default"
+    print("PASS: test_editable_queue_mode")
+    return True
+
+
+def test_notification_xml_all_tags():
+    """Verify notification XML output contains all 6 required XML tags."""
+    import inspect, v7_background_agent
+    source = inspect.getsource(v7_background_agent.agent_loop)
+    required_tags = [
+        "task-notification", "task-id", "task-type",
+        "status", "summary", "output-file"
+    ]
+    for tag in required_tags:
+        assert tag in source, f"agent_loop notification XML missing <{tag}> tag"
+    print("PASS: test_notification_xml_all_tags")
+    return True
+
+
+def test_output_file_append():
+    """Write twice to output file, verify both chunks present."""
+    from v7_background_agent import BackgroundManager
+    bm = BackgroundManager()
+    bm._write_output("test_append", "chunk1\n")
+    bm._write_output("test_append", "chunk2\n")
+    content = bm.read_output("test_append")
+    assert "chunk1" in content, "First chunk should be present"
+    assert "chunk2" in content, "Second chunk should be present"
+    # Cleanup
+    import v7_background_agent
+    output_path = v7_background_agent.OUTPUT_DIR / "test_append.txt"
+    output_path.unlink(missing_ok=True)
+    print("PASS: test_output_file_append")
+    return True
+
+
+def test_output_file_incremental_read():
+    """Write, read with offset, verify only new content returned."""
+    from v7_background_agent import BackgroundManager
+    bm = BackgroundManager()
+    bm._write_output("test_incr", "AAAA")
+    bm._write_output("test_incr", "BBBB")
+    # Read with offset=4 should skip first "AAAA"
+    result = bm.read_output("test_incr", offset=4)
+    assert result == "BBBB", f"Expected 'BBBB', got '{result}'"
+    # Cleanup
+    import v7_background_agent
+    output_path = v7_background_agent.OUTPUT_DIR / "test_incr.txt"
+    output_path.unlink(missing_ok=True)
+    print("PASS: test_output_file_incremental_read")
+    return True
+
+
+# =============================================================================
 # LLM Integration Tests
 # =============================================================================
 
@@ -554,6 +626,12 @@ if __name__ == "__main__":
         test_v7_summary_truncation,
         test_v7_event_based_waiting,
         test_v7_bash_run_in_background_schema,
+        # v7 new mechanism tests
+        test_non_editable_queue_mode,
+        test_editable_queue_mode,
+        test_notification_xml_all_tags,
+        test_output_file_append,
+        test_output_file_incremental_read,
         # LLM integration tests
         test_llm_uses_task_output,
         test_llm_uses_task_stop,

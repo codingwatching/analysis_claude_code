@@ -33,14 +33,15 @@ v5 compression clears in-memory todos. Subagents can't share tasks. The Tasks sy
 ```python
 @dataclass
 class Task:
-    id: str              # Auto-increment ID
+    id: str              # Auto-increment ID (highwatermark)
     subject: str         # Imperative title: "Fix auth bug"
     description: str     # Detailed description
     status: str = "pending"  # pending | in_progress | completed
-    active_form: str = ""    # Present tense: "Fixing auth bug"
+    active_form: str = ""    # Present participle: "Fixing auth bug"
     owner: str = ""          # Responsible agent
     blocks: list = []        # Tasks blocked by this one
     blocked_by: list = []    # Prerequisites blocking this task
+    metadata: dict = {}      # Arbitrary key-value pairs
 ```
 
 Why each field matters:
@@ -51,6 +52,51 @@ Why each field matters:
 | `owner` | Multi-agent: who is doing what |
 | `blocks/blockedBy` | Dependency graph for task orchestration |
 | `description` | Another agent can understand the task |
+| `metadata` | Extensible key-value data for any use case |
+
+## Task State Machine
+
+```
++--------+     update(status)     +-------------+     update(status)     +-----------+
+| pending| ------------------->   | in_progress | ------------------->   | completed |
++--------+                        +-------------+                        +-----------+
+    ^                                    |
+    |          update(status)            |
+    +------------------------------------+
+                (re-open)
+
+  Any state ---> deleted (permanent removal)
+```
+
+When a task transitions to `completed`, its dependents' `blocked_by` lists are automatically updated.
+
+## Highwatermark ID Allocation
+
+Task IDs are allocated using a highwatermark file (`.highwatermark`), not by scanning existing task files:
+
+```python
+HIGHWATERMARK_FILE = ".highwatermark"
+
+def _next_id(self):
+    """Get next task ID and persist highwatermark."""
+    with self._lock:
+        self._highwatermark += 1
+        (self.tasks_dir / HIGHWATERMARK_FILE).write_text(str(self._highwatermark))
+        return str(self._highwatermark)
+```
+
+This prevents ID reuse if tasks are deleted. On startup, the highwatermark is loaded from the file, or falls back to scanning existing task files if the file is missing.
+
+## Auto-Owner on Status Change
+
+When a task transitions to `in_progress` and has no owner, the agent automatically assigns itself:
+
+```python
+if kwargs.get("status") == "in_progress" and not task.owner:
+    task.owner = kwargs.get("owner", os.getenv("CLAUDE_AGENT_NAME", "agent"))
+```
+
+This saves the model from needing to explicitly set `owner` every time it starts a task.
 
 ## Four Tools
 

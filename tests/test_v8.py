@@ -1,5 +1,5 @@
 """
-Tests for v8_teammate_agent.py - Team collaboration & messaging.
+Tests for v8_team_agent.py - Team collaboration & messaging.
 
 13 unit tests for TeammateManager messaging, inbox, lifecycle, and task board sharing.
 3 additional tests for broadcast, TEAMMATE_TOOLS, and shutdown flow.
@@ -17,7 +17,7 @@ from tests.helpers import BASH_TOOL, READ_FILE_TOOL, WRITE_FILE_TOOL, EDIT_FILE_
 from tests.helpers import TASK_CREATE_TOOL, TASK_LIST_TOOL, TASK_UPDATE_TOOL
 
 from pathlib import Path
-from v8_teammate_agent import TeammateManager, Teammate, TaskManager
+from v8_team_agent import TeammateManager, Teammate, TaskManager
 
 
 # =============================================================================
@@ -337,7 +337,7 @@ def test_broadcast_sends_to_all():
 
 
 def test_teammate_tools_include_tasks():
-    from v8_teammate_agent import TEAMMATE_TOOLS
+    from v8_team_agent import TEAMMATE_TOOLS
     tool_names = [t["name"] for t in TEAMMATE_TOOLS]
 
     expected = ["TaskCreate", "TaskUpdate", "TaskList", "SendMessage"]
@@ -349,7 +349,7 @@ def test_teammate_tools_include_tasks():
 
 
 def test_v8_tools_in_all_tools():
-    from v8_teammate_agent import ALL_TOOLS
+    from v8_team_agent import ALL_TOOLS
     tool_names = {t["name"] for t in ALL_TOOLS}
     assert "TeamCreate" in tool_names, "ALL_TOOLS should include TeamCreate"
     assert "SendMessage" in tool_names, "ALL_TOOLS should include SendMessage"
@@ -366,7 +366,7 @@ def test_v8_tools_in_all_tools():
 
 def test_v8_tool_count():
     """Verify v8 has exactly 15 tools (v7's 12 + TeamCreate + SendMessage + TeamDelete)."""
-    from v8_teammate_agent import ALL_TOOLS
+    from v8_team_agent import ALL_TOOLS
     assert len(ALL_TOOLS) == 15, f"v8 should have 15 tools, got {len(ALL_TOOLS)}"
     print("PASS: test_v8_tool_count")
     return True
@@ -378,7 +378,7 @@ def test_v8_teammate_tools_subset():
     Teammates get BASE_TOOLS + task CRUD + SendMessage, but NOT the full
     lead toolset (no TeamCreate, TeamDelete, TaskOutput, TaskStop).
     """
-    from v8_teammate_agent import TEAMMATE_TOOLS, ALL_TOOLS
+    from v8_team_agent import TEAMMATE_TOOLS, ALL_TOOLS
     teammate_names = {t["name"] for t in TEAMMATE_TOOLS}
     all_names = {t["name"] for t in ALL_TOOLS}
 
@@ -397,7 +397,7 @@ def test_v8_teammate_tools_subset():
 
 def test_v8_message_types_constant():
     """Verify MESSAGE_TYPES includes all 5 required types."""
-    from v8_teammate_agent import TeammateManager
+    from v8_team_agent import TeammateManager
     expected = {"message", "broadcast", "shutdown_request",
                 "shutdown_response", "plan_approval_response"}
     assert TeammateManager.MESSAGE_TYPES == expected, \
@@ -453,29 +453,27 @@ def test_v8_inbox_jsonl_format():
     return True
 
 
-def test_v8_agent_loop_injects_identity():
-    """Verify v8 agent_loop or auto_compact re-injects teammate identity.
+def test_v8_agent_loop_structure():
+    """Verify v8 agent_loop has the notification drain pattern.
 
-    After context compression, the teammate needs to remember who it is.
-    The code should inject identity information after auto_compact.
+    The lead agent loop should drain background notifications before
+    each API call and inject them as user messages.
     """
-    import inspect, v8_teammate_agent
+    import inspect, v8_team_agent
 
-    # Check that teammate_loop or auto_compact references identity
-    source = open(v8_teammate_agent.__file__).read()
-    has_identity = ("identity" in source.lower() or
-                    "teammate_name" in source or
-                    "name" in source)
-    assert has_identity, \
-        "v8 code must reference teammate identity for re-injection after compression"
+    source = open(v8_team_agent.__file__).read()
+    has_notifications = "drain_notifications" in source
+    has_agent_loop = "def agent_loop" in source
+    assert has_notifications, "v8 code must have drain_notifications for notification bus"
+    assert has_agent_loop, "v8 code must have agent_loop function"
 
-    print("PASS: test_v8_agent_loop_injects_identity")
+    print("PASS: test_v8_agent_loop_structure")
     return True
 
 
 def test_v8_teams_dir_path():
     """Verify TEAMS_DIR is defined for file-based inbox persistence."""
-    from v8_teammate_agent import TEAMS_DIR
+    from v8_team_agent import TEAMS_DIR
     assert TEAMS_DIR is not None, "TEAMS_DIR must be defined"
     assert "teams" in str(TEAMS_DIR).lower(), \
         f"TEAMS_DIR should contain 'teams', got: {TEAMS_DIR}"
@@ -489,7 +487,7 @@ def test_v8_teammate_bg_prefix():
     v8 extends v7's prefix scheme: b=bash, a=agent, t=teammate.
     This is how the notification system distinguishes task types.
     """
-    from v8_teammate_agent import BackgroundManager
+    from v8_team_agent import BackgroundManager
     bm = BackgroundManager()
     tid = bm.run_in_background(lambda: "teammate result", task_type="teammate")
     assert tid.startswith("t"), f"Teammate task should start with 't', got '{tid[0]}'"
@@ -540,69 +538,65 @@ def test_find_teammate_cross_team():
     found_direct = tm._find_teammate("hidden-worker", "beta")
     assert found_direct is not None, "Should find with explicit team_name"
 
-    not_found = tm._find_teammate("hidden-worker", "alpha")
-    assert not_found is None, "Should not find in wrong team"
+    not_found = tm._find_teammate("nonexistent", "alpha")
+    assert not_found is None, "Should not find nonexistent teammate"
 
     inbox.unlink(missing_ok=True)
     print("PASS: test_find_teammate_cross_team")
     return True
 
 
-def test_teammate_loop_has_idle_phase():
-    """Verify _teammate_loop contains the idle phase polling mechanism.
+def test_teammate_loop_has_tool_loop():
+    """Verify _teammate_loop contains the tool execution loop structure.
 
-    The idle phase checks inbox every 2 seconds for 60 seconds,
-    and also looks for unclaimed tasks on the board.
+    v8_team_agent uses a simplified loop: process prompt, execute tools until
+    the model stops calling tools, then shutdown. No idle phase.
     """
     import inspect
     source = inspect.getsource(TeammateManager._teammate_loop)
 
-    assert "idle" in source, "Loop must set teammate status to 'idle'"
-    assert "check_inbox" in source, "Idle phase must check teammate inbox"
-    assert "sleep(2)" in source or "sleep( 2)" in source, \
-        "Idle phase should poll every 2 seconds"
-    assert "30" in source, "Idle phase should check 30 times (30 * 2s = 60s)"
+    assert "tool_use" in source, "Loop must check for tool_use stop reason"
+    assert "tool_calls" in source or "tool_use" in source, "Loop must handle tool calls"
+    assert "shutdown" in source, "Loop must handle shutdown"
+    assert "microcompact" in source, "Loop must support context compression"
 
-    print("PASS: test_teammate_loop_has_idle_phase")
+    print("PASS: test_teammate_loop_has_tool_loop")
     return True
 
 
-def test_teammate_loop_identity_reinjection():
-    """Verify _teammate_loop re-injects identity after auto_compact.
+def test_teammate_loop_context_compression():
+    """Verify _teammate_loop supports context compression via microcompact/auto_compact.
 
-    When context is compressed, the teammate might forget who it is.
-    The loop must re-inject identity information.
+    In the new simplified loop, the teammate still uses context compression
+    but does not re-inject identity or pick up unclaimed tasks.
     """
     import inspect
     source = inspect.getsource(TeammateManager._teammate_loop)
 
-    assert "auto_compact" in source, "Loop must call auto_compact"
-    assert "Remember" in source or "identity" in source.lower() or "teammate.name" in source, \
-        "Loop must re-inject identity after compression"
-    assert "teammate.team_name" in source, \
-        "Identity re-injection must include team name"
+    assert "auto_compact" in source or "microcompact" in source, \
+        "Loop must support context compression"
+    assert "should_compact" in source or "microcompact" in source, \
+        "Loop must check whether to compact"
 
-    print("PASS: test_teammate_loop_identity_reinjection")
+    print("PASS: test_teammate_loop_context_compression")
     return True
 
 
-def test_teammate_loop_unclaimed_task_pickup():
-    """Verify _teammate_loop picks up unclaimed, unblocked tasks.
+def test_teammate_loop_shutdown_on_done():
+    """Verify _teammate_loop shuts down when the model stops calling tools.
 
-    During the idle phase, teammates should detect tasks that are
-    pending, have no owner, and have no blockers -- and claim them.
+    In the simplified v8_team_agent, the teammate processes its prompt,
+    executes tools until stop_reason != tool_use, then terminates.
     """
     import inspect
     source = inspect.getsource(TeammateManager._teammate_loop)
 
-    assert "unclaimed" in source or ("pending" in source and "owner" in source), \
-        "Loop must check for unclaimed pending tasks"
-    assert "in_progress" in source, \
-        "Loop must set claimed task to in_progress"
-    assert "TASK_MGR" in source or "task_mgr" in source, \
-        "Loop must interact with the shared task manager"
+    assert "shutdown" in source, \
+        "Loop must set status to shutdown when done"
+    assert "stop_reason" in source or "tool_use" in source, \
+        "Loop must check stop_reason to decide when to exit"
 
-    print("PASS: test_teammate_loop_unclaimed_task_pickup")
+    print("PASS: test_teammate_loop_shutdown_on_done")
     return True
 
 
@@ -633,6 +627,110 @@ def test_broadcast_excludes_sender():
     for inbox in inboxes.values():
         inbox.unlink(missing_ok=True)
     print("PASS: test_broadcast_excludes_sender")
+    return True
+
+
+# =============================================================================
+# v8 New Mechanism Tests (from final_design.md)
+# =============================================================================
+
+
+def test_config_json_created():
+    """Create team, verify config.json exists with correct structure."""
+    import tempfile
+    import v8_team_agent
+    orig_dir = v8_team_agent.TEAMS_DIR
+    with tempfile.TemporaryDirectory() as tmpdir:
+        v8_team_agent.TEAMS_DIR = Path(tmpdir)
+        tm = TeammateManager()
+        tm.create_team("cfg-test")
+        config_path = Path(tmpdir) / "cfg-test" / "config.json"
+        assert config_path.exists(), "config.json should exist after create_team"
+        data = json.loads(config_path.read_text())
+        assert "name" in data, "config.json should have name"
+        assert data["name"] == "cfg-test"
+        v8_team_agent.TEAMS_DIR = orig_dir
+    print("PASS: test_config_json_created")
+    return True
+
+
+def test_agent_id_format():
+    """Spawn teammate, verify ID is '{name}@{team}'."""
+    tm = TeammateManager()
+    tm.create_team("id-test")
+    inbox = Path(tempfile.mktemp(suffix=".jsonl"))
+    mate = Teammate(name="alice", team_name="id-test", inbox_path=inbox)
+    assert mate.agent_id == "alice@id-test", \
+        f"Expected 'alice@id-test', got '{mate.agent_id}'"
+    inbox.unlink(missing_ok=True)
+    print("PASS: test_agent_id_format")
+    return True
+
+
+def test_teammate_colors_cycle():
+    """Spawn 7 teammates, verify colors cycle from array."""
+    from v8_team_agent import TEAMMATE_COLORS
+    tm = TeammateManager()
+    tm.create_team("color-test")
+    inboxes = []
+    colors_seen = []
+    for i in range(7):
+        inbox = Path(tempfile.mktemp(suffix=".jsonl"))
+        name = f"worker{i}"
+        color_idx = i % len(TEAMMATE_COLORS)
+        mate = Teammate(name=name, team_name="color-test", inbox_path=inbox,
+                        color=TEAMMATE_COLORS[color_idx])
+        tm._teams["color-test"][name] = mate
+        colors_seen.append(mate.color)
+        inboxes.append(inbox)
+    # Colors should cycle
+    assert colors_seen[0] == colors_seen[5], \
+        "Color at index 0 should equal color at index 5 (cycling)"
+    assert colors_seen[1] == colors_seen[6], \
+        "Color at index 1 should equal color at index 6 (cycling)"
+    for inbox in inboxes:
+        inbox.unlink(missing_ok=True)
+    print("PASS: test_teammate_colors_cycle")
+    return True
+
+
+def test_teammate_tools_includes_task_get():
+    """Verify TEAMMATE_TOOLS contains TaskGet."""
+    from v8_team_agent import TEAMMATE_TOOLS
+    tool_names = {t["name"] for t in TEAMMATE_TOOLS}
+    assert "TaskGet" in tool_names, "TEAMMATE_TOOLS must include TaskGet"
+    print("PASS: test_teammate_tools_includes_task_get")
+    return True
+
+
+def test_broadcast_no_recipient():
+    """Send broadcast, verify no recipient required."""
+    tm = TeammateManager()
+    tm.create_team("bcast-nr")
+    inbox = Path(tempfile.mktemp(suffix=".jsonl"))
+    mate = Teammate(name="recv", team_name="bcast-nr", inbox_path=inbox)
+    tm._teams["bcast-nr"]["recv"] = mate
+    # recipient="" is valid for broadcast
+    result = tm.send_message("", "Hello all", msg_type="broadcast",
+                             sender="lead", team_name="bcast-nr")
+    assert "error" not in result.lower(), \
+        f"Broadcast with empty recipient should succeed, got: {result}"
+    msgs = tm.check_inbox("recv", "bcast-nr")
+    assert len(msgs) >= 1, "Recipient should have received broadcast"
+    inbox.unlink(missing_ok=True)
+    print("PASS: test_broadcast_no_recipient")
+    return True
+
+
+def test_message_requires_recipient():
+    """Send message without valid recipient, verify error."""
+    tm = TeammateManager()
+    tm.create_team("recip-test")
+    result = tm.send_message("nonexistent", "Hello", msg_type="message",
+                             team_name="recip-test")
+    assert "error" in result.lower() or "not found" in result.lower(), \
+        f"Message to nonexistent recipient should fail, got: {result}"
+    print("PASS: test_message_requires_recipient")
     return True
 
 
@@ -818,16 +916,23 @@ if __name__ == "__main__":
         test_v8_message_types_constant,
         test_v8_teammate_status_lifecycle,
         test_v8_inbox_jsonl_format,
-        test_v8_agent_loop_injects_identity,
+        test_v8_agent_loop_structure,
         test_v8_teams_dir_path,
         test_v8_teammate_bg_prefix,
         test_spawn_teammate_error_no_team,
         test_spawn_teammate_returns_json,
         test_find_teammate_cross_team,
-        test_teammate_loop_has_idle_phase,
-        test_teammate_loop_identity_reinjection,
-        test_teammate_loop_unclaimed_task_pickup,
+        test_teammate_loop_has_tool_loop,
+        test_teammate_loop_context_compression,
+        test_teammate_loop_shutdown_on_done,
         test_broadcast_excludes_sender,
+        # v8 new mechanism tests
+        test_config_json_created,
+        test_agent_id_format,
+        test_teammate_colors_cycle,
+        test_teammate_tools_includes_task_get,
+        test_broadcast_no_recipient,
+        test_message_requires_recipient,
         # LLM integration tests
         test_llm_creates_team,
         test_llm_sends_message,

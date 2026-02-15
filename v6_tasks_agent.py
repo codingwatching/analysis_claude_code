@@ -1,21 +1,49 @@
 #!/usr/bin/env python3
 """
-v6_tasks_agent.py - Mini Claude Code: Tasks System (~750 lines)
+v6_tasks_agent.py - Mini Claude Code: Tasks System (~920 lines)
 
-Core Philosophy: "From Sticky Notes to Team Board"
-===================================================
-v2's TodoWrite was like a personal sticky note - one person, use it and toss it.
-v5's compression would wipe TodoWrite's data from memory.
+Core Philosophy: "A Shared Board Every Agent Can See and Update"
+================================================================
+v5 showed that compression is necessary for long sessions. But compression
+wipes in-memory state like TodoWrite's data. More importantly, when agents
+go from single to group, task management must evolve from "list" to "system".
 
 Tasks is a complete rethink:
 - CRUD operations (not overwrite-only)
-- File-based persistence (survives compression)
+- File-based persistence (survives compression and process boundaries)
 - Dependency graph (blocks / blockedBy)
 - Owner tracking (who's doing what)
 - Thread-safe (file locks for concurrent access)
 
-The key insight: When agents go from single to group, task management
-must evolve from "list" to "system".
+    TASK STATE MACHINE
+    ==================
+
+    +----------+   update(status)   +--------------+   update(status)   +-----------+
+    | pending  | ----------------> | in_progress  | ----------------> | completed |
+    +----------+                    +--------------+                    +-----------+
+         |                               |
+         |  update(status="deleted")     |  update(status="deleted")
+         v                               v
+    +-----------+                   +-----------+
+    | deleted   |                   | deleted   |
+    +-----------+                   +-----------+
+
+    DEPENDENCY GRAPH
+    ================
+
+    Task A (blocks: [B])           Task B (blocked_by: [A])
+    +-----------+                  +-----------+
+    | A: build  |  -- blocks -->   | B: deploy |
+    | status:   |                  | status:   |
+    | progress  |                  | pending   | (cannot start)
+    +-----------+                  +-----------+
+         |
+         | A completes -> auto-remove A from B.blocked_by
+         v
+    +-----------+                  +-----------+
+    | A: build  |                  | B: deploy |
+    | completed |                  | pending   | (can now start)
+    +-----------+                  +-----------+
 
 TodoWrite vs Tasks:
     TodoWrite: Model's self-discipline tool (v2: constraints enable)
@@ -64,6 +92,16 @@ MODEL = os.getenv("MODEL_ID", "claude-sonnet-4-5-20250929")
 # TaskManager - The core addition in v6
 # =============================================================================
 
+HIGHWATERMARK_FILE = ".highwatermark"
+
+
+def _resolve_task_list_id() -> str:
+    """Resolution order: CLAUDE_CODE_TASK_LIST_ID env > team_name > session fallback."""
+    return (os.environ.get("CLAUDE_CODE_TASK_LIST_ID")
+            or os.environ.get("CLAUDE_TEAM_NAME")
+            or "default")
+
+
 @dataclass
 class Task:
     id: str
@@ -74,6 +112,7 @@ class Task:
     owner: str = ""
     blocks: list = field(default_factory=list)
     blocked_by: list = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
 
 
 class TaskManager:
@@ -90,13 +129,21 @@ class TaskManager:
     """
 
     def __init__(self, tasks_dir: Path = None):
-        self.tasks_dir = tasks_dir or TASKS_DIR
-        self.tasks_dir.mkdir(exist_ok=True)
+        list_id = _resolve_task_list_id()
+        base_dir = tasks_dir or TASKS_DIR
+        self.tasks_dir = base_dir / list_id if list_id != "default" else base_dir
+        self.tasks_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._counter = self._load_counter()
 
     def _load_counter(self) -> int:
-        """Load next task ID from existing files."""
+        """Load next task ID from highwatermark file, falling back to file scan."""
+        hwm_path = self.tasks_dir / HIGHWATERMARK_FILE
+        if hwm_path.exists():
+            try:
+                return int(hwm_path.read_text().strip()) + 1
+            except ValueError:
+                pass
         existing = list(self.tasks_dir.glob("task_*.json"))
         if not existing:
             return 1
@@ -107,6 +154,14 @@ class TaskManager:
             except (ValueError, IndexError):
                 pass
         return max(ids) + 1 if ids else 1
+
+    def _next_task_id(self) -> int:
+        """Get next task ID and persist highwatermark."""
+        task_id = self._counter
+        self._counter += 1
+        hwm_path = self.tasks_dir / HIGHWATERMARK_FILE
+        hwm_path.write_text(str(task_id))
+        return task_id
 
     def _task_path(self, task_id: str) -> Path:
         return self.tasks_dir / f"task_{task_id}.json"
@@ -122,16 +177,17 @@ class TaskManager:
         data = json.loads(path.read_text())
         return Task(**data)
 
-    def create(self, subject: str, description: str = "", active_form: str = "") -> Task:
+    def create(self, subject: str, description: str = "", active_form: str = "", metadata: dict = None) -> Task:
         """Create a new task with auto-incrementing ID."""
         with self._lock:
+            task_id = self._next_task_id()
             task = Task(
-                id=str(self._counter),
+                id=str(task_id),
                 subject=subject,
                 description=description,
                 active_form=active_form or f"Working on: {subject}",
+                metadata=metadata or {},
             )
-            self._counter += 1
             self._save_task(task)
             return task
 
@@ -143,7 +199,7 @@ class TaskManager:
         """
         Update task fields.
 
-        Supports: status, subject, description, active_form, owner,
+        Supports: status, subject, description, active_form, owner, metadata,
                   addBlocks, addBlockedBy
         """
         with self._lock:
@@ -154,6 +210,13 @@ class TaskManager:
             for key in ("status", "subject", "description", "active_form", "owner"):
                 if key in kwargs:
                     setattr(task, key, kwargs[key])
+
+            if "metadata" in kwargs and isinstance(kwargs["metadata"], dict):
+                task.metadata.update(kwargs["metadata"])
+
+            # Auto-set owner when transitioning to in_progress without one
+            if kwargs.get("status") == "in_progress" and not task.owner:
+                task.owner = kwargs.get("owner", os.getenv("CLAUDE_AGENT_NAME", "agent"))
 
             if "addBlocks" in kwargs:
                 for blocked_id in kwargs["addBlocks"]:
@@ -221,9 +284,12 @@ TASK_MGR = TaskManager()
 class ContextManager:
     """Three-layer context compression (microcompact, auto-compact, manual)."""
 
-    COMPACTABLE_TOOLS = {"bash", "read_file", "Grep", "Glob"}
+    COMPACTABLE_TOOLS = {"bash", "read_file", "write_file", "edit_file"}
     KEEP_RECENT = 3
-    TOKEN_THRESHOLD = 0.93
+    # The real Claude Code formula: threshold = context_window - min(max_output, 20000) - 13000
+    # For a 128k window: 128000 - 20000 - 13000 = 95000 tokens.
+    # We use 93000 as a simplified constant for educational purposes.
+    TOKEN_THRESHOLD = 93000
     MAX_OUTPUT_TOKENS = 40000
 
     def __init__(self, max_context_tokens: int = 200000):
@@ -232,7 +298,8 @@ class ContextManager:
 
     @staticmethod
     def estimate_tokens(text: str) -> int:
-        return len(text) // 4
+        # cli.js PU1: Math.ceil(chars * 1.333) on serialized content
+        return len(text) * 4 // 3
 
     def microcompact(self, messages: list) -> list:
         tool_result_indices = []
@@ -257,7 +324,7 @@ class ContextManager:
 
     def should_compact(self, messages: list) -> bool:
         total = sum(self.estimate_tokens(json.dumps(m, default=str)) for m in messages)
-        return total > self.max_context_tokens * self.TOKEN_THRESHOLD
+        return total > self.TOKEN_THRESHOLD
 
     def auto_compact(self, messages: list) -> list:
         self.save_transcript(messages)
@@ -541,6 +608,7 @@ TASK_CREATE_TOOL = {
             "subject": {"type": "string", "description": "Brief imperative title: 'Fix auth bug'"},
             "description": {"type": "string", "description": "Detailed description of what needs to be done"},
             "activeForm": {"type": "string", "description": "Present continuous form: 'Fixing auth bug'"},
+            "metadata": {"type": "object", "description": "Arbitrary key-value metadata"},
         },
         "required": ["subject", "description"],
     },
@@ -567,6 +635,7 @@ TASK_UPDATE_TOOL = {
             "addBlockedBy": {"type": "array", "items": {"type": "string"}, "description": "Task IDs that must complete before this one"},
             "addBlocks": {"type": "array", "items": {"type": "string"}, "description": "Task IDs that this task blocks"},
             "owner": {"type": "string"},
+            "metadata": {"type": "object", "description": "Arbitrary key-value metadata to merge into the task"},
         },
         "required": ["taskId"],
     },
@@ -660,8 +729,8 @@ def run_skill(skill_name: str) -> str:
     return f'<skill-loaded name="{skill_name}">\n{content}\n</skill-loaded>\n\nFollow the instructions in the skill above to complete the user\'s task.'
 
 
-def run_task_create(subject: str, description: str = "", active_form: str = "") -> str:
-    task = TASK_MGR.create(subject, description, active_form)
+def run_task_create(subject: str, description: str = "", active_form: str = "", metadata: dict = None) -> str:
+    task = TASK_MGR.create(subject, description, active_form, metadata)
     return json.dumps({"id": task.id, "subject": task.subject, "status": task.status})
 
 
@@ -754,7 +823,7 @@ def execute_tool(name: str, args: dict) -> str:
     if name == "Skill":
         return run_skill(args["skill"])
     if name == "TaskCreate":
-        return run_task_create(args["subject"], args.get("description", ""), args.get("activeForm", ""))
+        return run_task_create(args["subject"], args.get("description", ""), args.get("activeForm", ""), args.get("metadata"))
     if name == "TaskGet":
         return run_task_get(args["taskId"])
     if name == "TaskUpdate":

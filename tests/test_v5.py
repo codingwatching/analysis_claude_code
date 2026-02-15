@@ -28,9 +28,11 @@ from v5_compression_agent import ContextManager
 
 def test_estimate_tokens():
     cm = ContextManager()
+    # estimate_tokens uses len(text) * 4 // 3
     result = cm.estimate_tokens("hello world")
-    assert result == len("hello world") // 4, f"Expected {len('hello world') // 4}, got {result}"
-    assert result == 2, f"'hello world' (11 chars) // 4 should be 2, got {result}"
+    expected = len("hello world") * 4 // 3  # 11 * 4 // 3 = 14
+    assert result == expected, f"Expected {expected}, got {result}"
+    assert result == 14, f"'hello world' (11 chars) * 4 // 3 should be 14, got {result}"
     print("PASS: test_estimate_tokens")
     return True
 
@@ -115,13 +117,14 @@ def test_microcompact_skips_small():
 
 
 def test_should_compact_threshold():
-    cm = ContextManager(max_context_tokens=1000)
-    large_content = "x" * 5000
-    messages = [
-        {"role": "user", "content": large_content},
-    ]
+    cm = ContextManager()
+    # should_compact has MIN_SAVINGS guard: if <=5 messages, savings=0 -> always False.
+    # Need >5 messages to properly trigger. Build 8 messages, each large enough
+    # that total tokens exceed TOKEN_THRESHOLD (170616).
+    chunk_size = cm.TOKEN_THRESHOLD * 3 // (4 * 8) + 100
+    messages = [{"role": "user", "content": "x" * chunk_size} for _ in range(8)]
     result = cm.should_compact(messages)
-    assert result is True, "should_compact should return True when tokens exceed threshold"
+    assert result is True, "should_compact should return True when tokens exceed TOKEN_THRESHOLD"
     print("PASS: test_should_compact_threshold")
     return True
 
@@ -263,22 +266,18 @@ def test_transcript_save_and_load():
 def test_microcompact_only_compactable_tools():
     """Verify only COMPACTABLE_TOOLS outputs get compacted; others are never touched.
 
-    COMPACTABLE_TOOLS = {"bash", "read_file", "Grep", "Glob"}
-    Non-compactable tools (write_file, edit_file) must NEVER be compacted,
-    regardless of output size.
+    COMPACTABLE_TOOLS = {"bash", "read_file", "write_file", "edit_file"}
+    All four base tools are compactable. Non-compactable tools like TodoWrite
+    should never be compacted.
     """
     cm = ContextManager()
 
-    # Build messages with a mix of compactable and non-compactable tool calls.
-    # We need enough tool results that some compactable ones exceed KEEP_RECENT
-    # and have large content (>1000 tokens = >4000 chars).
     large_output = "x" * 5000
 
-    # 5 compactable (bash) + 3 non-compactable (write_file, edit_file)
+    # 5 compactable (bash) + 3 compactable (write_file) + 2 compactable (edit_file) = 10
     assistant_content = []
     user_content = []
 
-    # First, 5 bash calls (compactable)
     for i in range(5):
         assistant_content.append({
             "type": "tool_use", "id": f"bash_{i}",
@@ -289,7 +288,6 @@ def test_microcompact_only_compactable_tools():
             "content": large_output
         })
 
-    # Then, 3 write_file calls (NOT compactable)
     for i in range(3):
         assistant_content.append({
             "type": "tool_use", "id": f"write_{i}",
@@ -300,7 +298,6 @@ def test_microcompact_only_compactable_tools():
             "content": large_output
         })
 
-    # Then, 2 edit_file calls (NOT compactable)
     for i in range(2):
         assistant_content.append({
             "type": "tool_use", "id": f"edit_{i}",
@@ -321,30 +318,19 @@ def test_microcompact_only_compactable_tools():
     compacted_marker = "[Output compacted - re-read if needed]"
     user_blocks = messages[1]["content"]
 
-    # Check non-compactable tools are NEVER compacted
-    for block in user_blocks:
-        tool_id = block.get("tool_use_id", "")
-        if tool_id.startswith("write_") or tool_id.startswith("edit_"):
-            assert block["content"] != compacted_marker, \
-                f"Non-compactable tool result {tool_id} must NEVER be compacted"
-            assert block["content"] == large_output, \
-                f"Non-compactable tool result {tool_id} content must be untouched"
-
-    # Check that at least some compactable (bash) results WERE compacted
-    bash_compacted = sum(
+    # All 10 are compactable. KEEP_RECENT=3, so 7 should be compacted.
+    total_compacted = sum(
         1 for b in user_blocks
-        if b.get("tool_use_id", "").startswith("bash_") and b["content"] == compacted_marker
+        if b["content"] == compacted_marker
     )
-    assert bash_compacted > 0, \
-        "Some old bash (compactable) tool results should have been compacted"
-
-    # The most recent KEEP_RECENT bash results should be preserved
-    bash_preserved = sum(
+    total_preserved = sum(
         1 for b in user_blocks
-        if b.get("tool_use_id", "").startswith("bash_") and b["content"] != compacted_marker
+        if b["content"] != compacted_marker
     )
-    assert bash_preserved == cm.KEEP_RECENT, \
-        f"Expected {cm.KEEP_RECENT} recent bash results preserved, got {bash_preserved}"
+    assert total_preserved == cm.KEEP_RECENT, \
+        f"Expected {cm.KEEP_RECENT} recent results preserved, got {total_preserved}"
+    assert total_compacted == 7, \
+        f"Expected 7 compacted (10 - KEEP_RECENT=3), got {total_compacted}"
 
     print("PASS: test_microcompact_only_compactable_tools")
     return True
@@ -515,10 +501,9 @@ def test_compact_command_in_repl():
 
 
 def test_compactable_tools_constant():
-    """Verify COMPACTABLE_TOOLS is defined and contains the right tools.
+    """Verify COMPACTABLE_TOOLS is defined and contains all base tools.
 
-    Only read-oriented tools have their outputs compacted. Write/edit
-    outputs must never be compacted (they contain confirmation data).
+    All four base tools (bash, read_file, write_file, edit_file) are compactable.
     """
     from v5_compression_agent import ContextManager
     cm = ContextManager()
@@ -528,8 +513,8 @@ def test_compactable_tools_constant():
     compactable = cm.COMPACTABLE_TOOLS
     assert "bash" in compactable, "bash should be compactable"
     assert "read_file" in compactable, "read_file should be compactable"
-    assert "write_file" not in compactable, "write_file must NOT be compactable"
-    assert "edit_file" not in compactable, "edit_file must NOT be compactable"
+    assert "write_file" in compactable, "write_file should be compactable"
+    assert "edit_file" in compactable, "edit_file should be compactable"
 
     print("PASS: test_compactable_tools_constant")
     return True
@@ -550,14 +535,17 @@ def test_keep_recent_constant():
 
 
 def test_token_threshold_constant():
-    """Verify TOKEN_THRESHOLD is defined for auto-compact trigger."""
-    from v5_compression_agent import ContextManager
+    """Verify TOKEN_THRESHOLD is defined via auto_compact_threshold()."""
+    from v5_compression_agent import ContextManager, auto_compact_threshold
     cm = ContextManager()
 
     assert hasattr(cm, "TOKEN_THRESHOLD"), \
         "ContextManager must define TOKEN_THRESHOLD"
-    assert 0.5 <= cm.TOKEN_THRESHOLD <= 1.0, \
-        f"TOKEN_THRESHOLD should be between 0.5 and 1.0, got {cm.TOKEN_THRESHOLD}"
+    assert cm.TOKEN_THRESHOLD > 0, \
+        f"TOKEN_THRESHOLD must be positive, got {cm.TOKEN_THRESHOLD}"
+    # TOKEN_THRESHOLD = auto_compact_threshold() = 200000 - 16384 - 13000 = 170616
+    assert cm.TOKEN_THRESHOLD == auto_compact_threshold(), \
+        f"TOKEN_THRESHOLD should match auto_compact_threshold(), got {cm.TOKEN_THRESHOLD}"
 
     print("PASS: test_token_threshold_constant")
     return True
@@ -575,6 +563,121 @@ def test_notification_drain_in_agent_loop():
         "v5 agent_loop should NOT have drain_notifications (that's v7)"
 
     print("PASS: test_notification_drain_in_agent_loop")
+    return True
+
+
+# =============================================================================
+# v5 New Mechanism Tests (from final_design.md)
+# =============================================================================
+
+
+def test_auto_compact_threshold_default():
+    """Verify auto_compact_threshold default: (200000, 16384) -> 170616."""
+    from v5_compression_agent import auto_compact_threshold
+    result = auto_compact_threshold()
+    assert result == 200000 - 16384 - 13000, \
+        f"Expected 170616, got {result}"
+    assert result == 170616
+    print("PASS: test_auto_compact_threshold_default")
+    return True
+
+
+def test_auto_compact_threshold_large_output():
+    """Verify max_output > 20000 is capped at 20000."""
+    from v5_compression_agent import auto_compact_threshold
+    result = auto_compact_threshold(context_window=200000, max_output=50000)
+    expected = 200000 - 20000 - 13000  # capped at 20000
+    assert result == expected, f"Expected {expected}, got {result}"
+    print("PASS: test_auto_compact_threshold_large_output")
+    return True
+
+
+def test_min_savings_guard():
+    """Verify compact is skipped when savings < MIN_SAVINGS."""
+    from v5_compression_agent import ContextManager, MIN_SAVINGS
+
+    cm = ContextManager()
+    # With <= 5 messages, recent_size == total, so savings == 0 < MIN_SAVINGS
+    # This should always return False regardless of total size
+    big_msg = [{"role": "user", "content": "x" * 200000}]
+    assert not cm.should_compact(big_msg), \
+        "Single message should be skipped (savings = 0 < MIN_SAVINGS)"
+    print("PASS: test_min_savings_guard")
+    return True
+
+
+def test_min_savings_guard_proceeds():
+    """Verify compact proceeds when savings >= MIN_SAVINGS."""
+    from v5_compression_agent import ContextManager, MIN_SAVINGS
+
+    cm = ContextManager()
+    # Build 8 messages, each with enough content to exceed threshold
+    # First 3 messages will have enough tokens to produce savings >= MIN_SAVINGS
+    chunk_size = cm.TOKEN_THRESHOLD * 3 // (4 * 8) + 100
+    messages = [{"role": "user", "content": "x" * chunk_size} for _ in range(8)]
+    assert cm.should_compact(messages), \
+        "With 8 large messages, savings should exceed MIN_SAVINGS"
+    print("PASS: test_min_savings_guard_proceeds")
+    return True
+
+
+def test_estimate_tokens_formula():
+    """Verify estimate_tokens("a" * 300) == 400 (300 * 4 // 3)."""
+    cm = ContextManager()
+    result = cm.estimate_tokens("a" * 300)
+    assert result == 400, f"Expected 400, got {result}"
+    print("PASS: test_estimate_tokens_formula")
+    return True
+
+
+def test_compactable_tools_valid():
+    """Verify every name in COMPACTABLE_TOOLS exists in the tool definitions."""
+    from v5_compression_agent import ContextManager, ALL_TOOLS
+    cm = ContextManager()
+    tool_names = {t["name"] for t in ALL_TOOLS}
+    for name in cm.COMPACTABLE_TOOLS:
+        assert name in tool_names, \
+            f"COMPACTABLE_TOOLS entry '{name}' not found in TOOLS"
+    print("PASS: test_compactable_tools_valid")
+    return True
+
+
+def test_restore_recent_files_limits():
+    """Verify restore_recent_files respects MAX_RESTORE_FILES and token limits."""
+    from v5_compression_agent import ContextManager, MAX_RESTORE_FILES, \
+        MAX_RESTORE_TOKENS_PER_FILE, MAX_RESTORE_TOKENS_TOTAL
+
+    assert MAX_RESTORE_FILES == 5
+    assert MAX_RESTORE_TOKENS_PER_FILE == 5000
+    assert MAX_RESTORE_TOKENS_TOTAL == 50000
+
+    cm = ContextManager()
+    # Empty history should restore nothing
+    result = cm.restore_recent_files([])
+    assert result == [], "Empty messages should return empty restore list"
+    print("PASS: test_restore_recent_files_limits")
+    return True
+
+
+def test_restore_recent_files_empty_cache():
+    """Verify restore_recent_files returns empty list for no read_file calls."""
+    cm = ContextManager()
+    messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+    ]
+    result = cm.restore_recent_files(messages)
+    assert result == [], "No read_file calls should produce empty restore list"
+    print("PASS: test_restore_recent_files_empty_cache")
+    return True
+
+
+def test_image_token_constant():
+    """Verify IMAGE_TOKEN_ESTIMATE == 2000."""
+    from v5_compression_agent import IMAGE_TOKEN_ESTIMATE
+    assert IMAGE_TOKEN_ESTIMATE == 2000, \
+        f"IMAGE_TOKEN_ESTIMATE should be 2000, got {IMAGE_TOKEN_ESTIMATE}"
+    print("PASS: test_image_token_constant")
     return True
 
 
@@ -603,6 +706,16 @@ if __name__ == "__main__":
         test_keep_recent_constant,
         test_token_threshold_constant,
         test_notification_drain_in_agent_loop,
+        # v5 new mechanism tests
+        test_auto_compact_threshold_default,
+        test_auto_compact_threshold_large_output,
+        test_min_savings_guard,
+        test_min_savings_guard_proceeds,
+        test_estimate_tokens_formula,
+        test_compactable_tools_valid,
+        test_restore_recent_files_limits,
+        test_restore_recent_files_empty_cache,
+        test_image_token_constant,
         # LLM integration
         test_llm_reads_multiple_files,
         test_llm_read_edit_workflow,

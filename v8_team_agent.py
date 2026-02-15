@@ -1,24 +1,49 @@
 #!/usr/bin/env python3
 """
-v8_teammate_agent.py - Mini Claude Code: Team Collaboration (~900 lines)
+v8_team_agent.py - Mini Claude Code: Team Messaging (~1200 lines)
 
 Core Philosophy: "From Commands to Collaboration"
 ==================================================
 v3 gave us subagents: spawn, execute, return, destroy. Like dispatching interns.
 v7 gave us background execution: do multiple things at once without blocking.
 
-v8 introduces teammates: persistent agents that live across tasks,
-communicate through inboxes, and share a task board. Like colleagues
-who stay in the office all day.
+v8 introduces teams: persistent agents that communicate through inboxes
+and share a task board. Unlike one-shot subagents, teammates stay alive
+after completing their immediate work -- but in this version they shut down
+once they run out of tool calls to make. (v9 adds the full idle cycle.)
 
     Subagent lifecycle:  spawn -> execute -> return -> destroyed
-    Teammate lifecycle:  spawn -> work -> idle -> work -> ... -> shutdown
+    Teammate lifecycle:  spawn -> work (tool loop) -> finish -> shutdown
+
+    MESSAGE ROUTING
+    ===============
+
+    Team Lead                                  config.json
+    +-----------+                              +-----------+
+    | SendMsg() |                              | team:     |
+    +-----+-----+                              |  members  |
+          |                                    |  config   |
+          v                                    +-----------+
+    +------------------+
+    | TeammateManager  |
+    | .send_message()  |    point-to-point        inbox lock
+    |                  +----> /team/A_inbox.jsonl  (atomic writes)
+    | .send_message()  |
+    | type=broadcast   +----> /team/B_inbox.jsonl
+    |                  +----> /team/C_inbox.jsonl
+    +------------------+
+                              ^
+                              |
+    +-----------+    check_inbox() drains
+    | Teammate  | <-----------+
+    | A_inbox   |
+    +-----------+
 
 Three mechanisms combine:
 
     Tasks (from v6)     Shared task board. Every agent (lead, subagent,
-                        teammate) sees the same tasks. Teammates can claim
-                        unclaimed tasks autonomously.
+                        teammate) sees the same tasks. Teammates can
+                        update their progress through the board.
 
     Background (from v7) Thread-based parallel execution. Teammates run
                         in daemon threads, same infrastructure as background
@@ -31,22 +56,21 @@ Three mechanisms combine:
 Comparison:
     Feature              Subagent (v3)         Teammate (v8)
     -----------------------------------------------------------
-    Lifecycle            one-shot              persistent
+    Lifecycle            one-shot              persistent (per prompt)
     Communication        return value only     inbox messaging
     Task awareness       none                  shared task board
     Parallelism          blocking by default   always background
     Identity             anonymous             named, team member
-    Autonomy             none (executes order) picks up tasks
 
 Key design details:
-    - TEAMMATE_TOOLS: teammates get BASE_TOOLS + task CRUD + SendMessage
-      (not the full lead toolset, but enough to coordinate)
-    - broadcast() sends to ALL teammates, not requiring a specific recipient
-    - auto_compact re-injects teammate identity after context compression
-    - Team state persisted via file-based inboxes in .teams/ directory
+    - Agent IDs use format {name}@{teamName} for unique identification
+    - TEAMMATE_TOOLS: BASE_TOOLS + task CRUD (incl TaskGet) + SendMessage
+    - broadcast() sends to ALL teammates in team, excluding the sender
+    - Inbox writes are atomic (lock files prevent concurrent corruption)
+    - config.json persists team structure under .teams/{name}/
 
 Usage:
-    python v8_teammate_agent.py
+    python v8_team_agent.py
 """
 
 import json
@@ -80,6 +104,8 @@ WORKDIR = Path.cwd()
 SKILLS_DIR = WORKDIR / "skills"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TASKS_DIR = WORKDIR / ".tasks"
+# cli.js stores team config at ~/.claude/teams/{name}/config.json;
+# we use a local .teams/ directory for educational simplicity.
 TEAMS_DIR = WORKDIR / ".teams"
 
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
@@ -90,13 +116,30 @@ MODEL = os.getenv("MODEL_ID", "claude-sonnet-4-5-20250929")
 # TeammateManager
 # =============================================================================
 
+# ANSI colors for teammate output (cycles through for visual distinction)
+TEAMMATE_COLORS = [
+    "\033[36m",   # cyan
+    "\033[33m",   # yellow
+    "\033[35m",   # magenta
+    "\033[32m",   # green
+    "\033[34m",   # blue
+]
+COLOR_RESET = "\033[0m"
+
+
 @dataclass
 class Teammate:
     name: str
     team_name: str
+    agent_id: str = ""
     status: str = "active"
     thread: threading.Thread = field(default=None, repr=False)
     inbox_path: Path = field(default=None)
+    color: str = ""
+
+    def __post_init__(self):
+        if not self.agent_id:
+            self.agent_id = f"{self.name}@{self.team_name}"
 
 
 class TeammateManager:
@@ -131,6 +174,13 @@ class TeammateManager:
             self._teams[name] = {}
             team_dir = TEAMS_DIR / name
             team_dir.mkdir(exist_ok=True)
+            # Persist team configuration
+            config_path = team_dir / "config.json"
+            config_path.write_text(json.dumps({
+                "name": name,
+                "created_at": time.time(),
+                "members": [],
+            }, indent=2))
             return f"Team '{name}' created"
 
     def spawn_teammate(self, name: str, team_name: str, prompt: str) -> str:
@@ -141,8 +191,14 @@ class TeammateManager:
             if name in self._teams[team_name]:
                 return f"Error: Teammate '{name}' already exists in team '{team_name}'"
 
+            color_idx = len(self._teams[team_name]) % len(TEAMMATE_COLORS)
             inbox_path = TEAMS_DIR / team_name / f"{name}_inbox.jsonl"
-            teammate = Teammate(name=name, team_name=team_name, inbox_path=inbox_path)
+            teammate = Teammate(
+                name=name,
+                team_name=team_name,
+                inbox_path=inbox_path,
+                color=TEAMMATE_COLORS[color_idx],
+            )
 
             def run():
                 self._teammate_loop(teammate, prompt)
@@ -150,9 +206,57 @@ class TeammateManager:
             thread = threading.Thread(target=run, daemon=True)
             teammate.thread = thread
             self._teams[team_name][name] = teammate
-            thread.start()
 
-            return json.dumps({"name": name, "team": team_name, "status": "active"})
+            # Update config.json with new member
+            self._update_team_config(team_name)
+
+            thread.start()
+            return json.dumps({
+                "name": name,
+                "team": team_name,
+                "agent_id": teammate.agent_id,
+                "status": "active",
+            })
+
+    def _update_team_config(self, team_name: str):
+        """Update config.json to reflect current team membership."""
+        team_dir = TEAMS_DIR / team_name
+        config_path = team_dir / "config.json"
+        config = {}
+        if config_path.exists():
+            try:
+                config = json.loads(config_path.read_text())
+            except json.JSONDecodeError:
+                pass
+        config["members"] = [
+            {"name": tm.name, "agent_id": tm.agent_id, "status": tm.status}
+            for tm in self._teams.get(team_name, {}).values()
+        ]
+        config_path.write_text(json.dumps(config, indent=2))
+
+    def _write_to_inbox(self, inbox_path: Path, message: dict):
+        """Atomically write a message to an inbox using a lock file."""
+        lock_path = inbox_path.with_suffix(".lock")
+        # Simple spin-lock with file
+        for _ in range(50):
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                break
+            except FileExistsError:
+                time.sleep(0.05)
+        else:
+            # Fallback: write without lock after timeout
+            pass
+
+        try:
+            with open(inbox_path, "a") as f:
+                f.write(json.dumps(message) + "\n")
+        finally:
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def send_message(self, recipient: str, content: str, msg_type: str = "message",
                      sender: str = "lead", team_name: str = None) -> str:
@@ -167,23 +271,20 @@ class TeammateManager:
             "timestamp": time.time(),
         }
 
-        # Broadcast: send to ALL teammates in the team (not to a specific recipient)
+        # Broadcast: send to ALL teammates in the team, excluding sender
         if msg_type == "broadcast":
             resolved_team = team_name
             if not resolved_team:
-                # Try to find team from sender or recipient hint
                 for tname, team in self._teams.items():
                     if sender in team or recipient in team:
                         resolved_team = tname
                         break
             if not resolved_team:
-                # Fall back: broadcast to all teams
                 count = 0
                 for tname, team in self._teams.items():
                     for tm_name, tm in team.items():
                         if tm_name != sender:
-                            with open(tm.inbox_path, "a") as f:
-                                f.write(json.dumps(message) + "\n")
+                            self._write_to_inbox(tm.inbox_path, message)
                             count += 1
                 return f"Broadcast sent to {count} teammates across all teams"
 
@@ -191,8 +292,7 @@ class TeammateManager:
             count = 0
             for tm_name, tm in team.items():
                 if tm_name != sender:
-                    with open(tm.inbox_path, "a") as f:
-                        f.write(json.dumps(message) + "\n")
+                    self._write_to_inbox(tm.inbox_path, message)
                     count += 1
             return f"Broadcast sent to {count} teammates in team '{resolved_team}'"
 
@@ -201,9 +301,7 @@ class TeammateManager:
         if not teammate:
             return f"Error: Teammate '{recipient}' not found"
 
-        with open(teammate.inbox_path, "a") as f:
-            f.write(json.dumps(message) + "\n")
-
+        self._write_to_inbox(teammate.inbox_path, message)
         return f"Message sent to {recipient}"
 
     def check_inbox(self, name: str, team_name: str = None) -> list:
@@ -273,25 +371,21 @@ class TeammateManager:
 
     def _teammate_loop(self, teammate: Teammate, initial_prompt: str):
         """
-        The teammate work cycle: active -> idle -> check inbox -> active.
+        Simplified teammate work cycle: receive prompt -> tool loop -> shutdown.
 
-        Unlike subagents that execute and die, teammates persist:
-        they complete their work, go idle, then wake up when new
-        messages arrive or unclaimed tasks appear.
-
-        Teammates get TEAMMATE_TOOLS so they can interact with the
-        shared task board (TaskCreate, TaskUpdate, TaskList) and
-        communicate with other teammates (SendMessage).
-
-        When auto_compact compresses context, we re-inject the
-        teammate's identity so it doesn't forget who it is.
+        The teammate processes the initial prompt, executing tool calls until
+        the model decides to stop (stop_reason != tool_use), then exits.
+        No idle phase, no auto-claiming -- those are v9 features.
         """
-        sub_system = f"""You are teammate '{teammate.name}' in team '{teammate.team_name}' at {WORKDIR}.
+        color = teammate.color
+        reset = COLOR_RESET
+        prefix = f"{color}[{teammate.agent_id}]{reset}"
 
-Work on your assigned tasks. Use TaskList to find unclaimed tasks.
+        sub_system = f"""You are teammate '{teammate.name}' ({teammate.agent_id}) in team '{teammate.team_name}' at {WORKDIR}.
+
+Work on your assigned tasks. Use TaskList to find tasks.
+Use TaskGet to read task details before starting work.
 Use TaskUpdate to mark progress. Use SendMessage to communicate with teammates.
-When done with current work, report completion and wait for new instructions.
-
 Complete work efficiently and report results clearly."""
 
         sub_tools = _get_teammate_tools()
@@ -301,17 +395,25 @@ Complete work efficiently and report results clearly."""
             teammate.status = "active"
 
             try:
+                # Check for incoming messages before each turn
+                inbox_messages = self.check_inbox(teammate.name, teammate.team_name)
+                if inbox_messages:
+                    inbox_text = "\n".join(
+                        f"<teammate-message sender=\"{m.get('sender', '?')}\" type=\"{m.get('type', 'message')}\">\n{m.get('content', '')}\n</teammate-message>"
+                        for m in inbox_messages
+                    )
+                    if sub_messages and sub_messages[-1].get("role") == "user":
+                        content = sub_messages[-1].get("content", "")
+                        if isinstance(content, str):
+                            sub_messages[-1]["content"] = content + "\n\n" + inbox_text
+                        elif isinstance(content, list):
+                            content.append({"type": "text", "text": inbox_text})
+                    else:
+                        sub_messages.append({"role": "user", "content": inbox_text})
+
                 sub_messages = CTX.microcompact(sub_messages)
                 if CTX.should_compact(sub_messages):
                     sub_messages = CTX.auto_compact(sub_messages)
-                    # Re-inject identity after compression so the teammate
-                    # remembers who it is even after context was summarized
-                    identity = (f"\n\nRemember: You are teammate '{teammate.name}' "
-                                f"in team '{teammate.team_name}'.")
-                    if sub_messages and sub_messages[0].get("role") == "user":
-                        content = sub_messages[0].get("content", "")
-                        if isinstance(content, str):
-                            sub_messages[0]["content"] = content + identity
 
                 response = client.messages.create(
                     model=MODEL, system=sub_system,
@@ -329,46 +431,15 @@ Complete work efficiently and report results clearly."""
                     sub_messages.append({"role": "user", "content": results})
                     continue
                 else:
-                    sub_messages.append({"role": "assistant", "content": response.content})
-
-            except Exception as e:
-                sub_messages.append({"role": "assistant", "content": [{"type": "text", "text": f"Error: {e}"}]})
-
-            # Idle phase: wait for new messages or unclaimed tasks
-            teammate.status = "idle"
-
-            for _ in range(30):  # Check every 2 seconds for 60 seconds
-                if teammate.status == "shutdown":
+                    # No more tool calls -- teammate work is done
+                    teammate.status = "shutdown"
+                    self._update_team_config(teammate.team_name)
                     return
 
-                new_messages = self.check_inbox(teammate.name, teammate.team_name)
-                if new_messages:
-                    for msg in new_messages:
-                        if msg.get("type") == "shutdown_request":
-                            teammate.status = "shutdown"
-                            return
-
-                    msg_text = "\n".join(
-                        f"[{m.get('sender', '?')}] ({m.get('type', 'message')}): {m.get('content', '')}"
-                        for m in new_messages
-                    )
-                    sub_messages.append({"role": "user", "content": f"New messages:\n{msg_text}"})
-                    break
-
-                unclaimed = [t for t in TASK_MGR.list_all()
-                             if t.status == "pending" and not t.owner and not t.blocked_by]
-                if unclaimed:
-                    task = unclaimed[0]
-                    TASK_MGR.update(task.id, status="in_progress", owner=teammate.name)
-                    sub_messages.append({
-                        "role": "user",
-                        "content": f"Unclaimed task found - #{task.id}: {task.subject}\n{task.description}"
-                    })
-                    break
-
-                time.sleep(2)
-            else:
-                continue
+            except Exception as e:
+                teammate.status = "shutdown"
+                self._update_team_config(teammate.team_name)
+                return
 
 
 TEAM_MGR = TeammateManager()
@@ -634,9 +705,12 @@ TASK_MGR = TaskManager()
 class ContextManager:
     """Three-layer context compression: microcompact, should_compact, auto_compact."""
 
-    COMPACTABLE_TOOLS = {"bash", "read_file", "Grep", "Glob"}
+    COMPACTABLE_TOOLS = {"bash", "read_file", "write_file", "edit_file"}
     KEEP_RECENT = 3
-    TOKEN_THRESHOLD = 0.93
+    # The real Claude Code formula: threshold = context_window - min(max_output, 20000) - 13000
+    # For a 128k window: 128000 - 20000 - 13000 = 95000 tokens.
+    # We use 93000 as a simplified constant for educational purposes.
+    TOKEN_THRESHOLD = 93000
     MAX_OUTPUT_TOKENS = 40000
 
     def __init__(self, max_context_tokens: int = 200000):
@@ -645,7 +719,8 @@ class ContextManager:
 
     @staticmethod
     def estimate_tokens(text: str) -> int:
-        return len(text) // 4
+        # cli.js PU1: Math.ceil(chars * 1.333) on serialized content
+        return len(text) * 4 // 3
 
     def microcompact(self, messages: list) -> list:
         tool_result_indices = []
@@ -670,7 +745,7 @@ class ContextManager:
 
     def should_compact(self, messages: list) -> bool:
         total = sum(self.estimate_tokens(json.dumps(m, default=str)) for m in messages)
-        return total > self.max_context_tokens * self.TOKEN_THRESHOLD
+        return total > self.TOKEN_THRESHOLD
 
     def auto_compact(self, messages: list) -> list:
         self.save_transcript(messages)
@@ -967,10 +1042,8 @@ TEAM_DELETE_TOOL = {
     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
 }
 
-# Teammate tools: base tools + task CRUD + messaging
-# This is the toolset each teammate receives so they can interact
-# with the shared task board and communicate with other agents.
-TEAMMATE_TOOLS = BASE_TOOLS + [TASK_CREATE_TOOL, TASK_UPDATE_TOOL, TASK_LIST_TOOL, SEND_MESSAGE_TOOL]
+# Teammate tools: base tools + task CRUD (including TaskGet) + messaging
+TEAMMATE_TOOLS = BASE_TOOLS + [TASK_CREATE_TOOL, TASK_GET_TOOL, TASK_UPDATE_TOOL, TASK_LIST_TOOL, SEND_MESSAGE_TOOL]
 
 # Lead agent tools: everything
 ALL_TOOLS = BASE_TOOLS + [
@@ -1186,6 +1259,7 @@ def execute_tool(name: str, args: dict) -> str:
         return TEAM_MGR.send_message(
             args["recipient"], args["content"],
             args.get("type", "message"),
+            sender=args.get("sender", "lead"),
             team_name=args.get("team_name"),
         )
     if name == "TeamDelete":
@@ -1279,7 +1353,7 @@ def agent_loop(messages: list) -> list:
 # =============================================================================
 
 def main():
-    print(f"Mini Claude Code v8 (with Teammates) - {WORKDIR}")
+    print(f"Mini Claude Code v8 (with Teams) - {WORKDIR}")
     print(f"Skills: {', '.join(SKILLS.list_skills()) or 'none'}")
     print("Commands: /compact, /tasks, /team, exit")
     print()

@@ -397,6 +397,146 @@ def test_v6_dependency_bidirectional():
 
 
 # =============================================================================
+# v6 New Mechanism Tests (from final_design.md)
+# =============================================================================
+
+
+def test_highwatermark_persistence():
+    """Create 3 tasks, delete task dir content, recreate manager, verify IDs continue from 4."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tm = TaskManager(Path(tmpdir))
+        tm.create("Task A")
+        tm.create("Task B")
+        tm.create("Task C")
+
+        # Delete task files but keep the highwatermark file
+        for f in Path(tmpdir).glob("task_*.json"):
+            f.unlink()
+
+        # Recreate manager from same dir
+        tm2 = TaskManager(Path(tmpdir))
+        t4 = tm2.create("Task D")
+        assert t4.id == "4", f"Expected id '4' (continuing from highwatermark), got '{t4.id}'"
+    print("PASS: test_highwatermark_persistence")
+    return True
+
+
+def test_resolve_task_list_id_env_var():
+    """Set CLAUDE_CODE_TASK_LIST_ID env var, verify it wins."""
+    from v6_tasks_agent import _resolve_task_list_id
+    old = os.environ.get("CLAUDE_CODE_TASK_LIST_ID")
+    old_team = os.environ.get("CLAUDE_TEAM_NAME")
+    try:
+        os.environ["CLAUDE_CODE_TASK_LIST_ID"] = "my-task-list"
+        os.environ["CLAUDE_TEAM_NAME"] = "my-team"
+        result = _resolve_task_list_id()
+        assert result == "my-task-list", f"Expected 'my-task-list', got '{result}'"
+    finally:
+        if old is not None:
+            os.environ["CLAUDE_CODE_TASK_LIST_ID"] = old
+        else:
+            os.environ.pop("CLAUDE_CODE_TASK_LIST_ID", None)
+        if old_team is not None:
+            os.environ["CLAUDE_TEAM_NAME"] = old_team
+        else:
+            os.environ.pop("CLAUDE_TEAM_NAME", None)
+    print("PASS: test_resolve_task_list_id_env_var")
+    return True
+
+
+def test_resolve_task_list_id_team_name():
+    """Set CLAUDE_TEAM_NAME env, verify it wins over default."""
+    from v6_tasks_agent import _resolve_task_list_id
+    old_list = os.environ.get("CLAUDE_CODE_TASK_LIST_ID")
+    old_team = os.environ.get("CLAUDE_TEAM_NAME")
+    try:
+        os.environ.pop("CLAUDE_CODE_TASK_LIST_ID", None)
+        os.environ["CLAUDE_TEAM_NAME"] = "team-alpha"
+        result = _resolve_task_list_id()
+        assert result == "team-alpha", f"Expected 'team-alpha', got '{result}'"
+    finally:
+        if old_list is not None:
+            os.environ["CLAUDE_CODE_TASK_LIST_ID"] = old_list
+        else:
+            os.environ.pop("CLAUDE_CODE_TASK_LIST_ID", None)
+        if old_team is not None:
+            os.environ["CLAUDE_TEAM_NAME"] = old_team
+        else:
+            os.environ.pop("CLAUDE_TEAM_NAME", None)
+    print("PASS: test_resolve_task_list_id_team_name")
+    return True
+
+
+def test_resolve_task_list_id_default():
+    """No env vars set, verify 'default'."""
+    from v6_tasks_agent import _resolve_task_list_id
+    old_list = os.environ.get("CLAUDE_CODE_TASK_LIST_ID")
+    old_team = os.environ.get("CLAUDE_TEAM_NAME")
+    try:
+        os.environ.pop("CLAUDE_CODE_TASK_LIST_ID", None)
+        os.environ.pop("CLAUDE_TEAM_NAME", None)
+        result = _resolve_task_list_id()
+        assert result == "default", f"Expected 'default', got '{result}'"
+    finally:
+        if old_list is not None:
+            os.environ["CLAUDE_CODE_TASK_LIST_ID"] = old_list
+        if old_team is not None:
+            os.environ["CLAUDE_TEAM_NAME"] = old_team
+    print("PASS: test_resolve_task_list_id_default")
+    return True
+
+
+def test_metadata_field_roundtrip():
+    """Create task with metadata, verify retrieval."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tm = TaskManager(Path(tmpdir))
+        t = tm.create("Task with meta", "desc", metadata={"priority": "high", "labels": "bug"})
+        assert t.metadata == {"priority": "high", "labels": "bug"}, \
+            f"Metadata mismatch: {t.metadata}"
+        # Verify persisted
+        tm2 = TaskManager(Path(tmpdir))
+        t2 = tm2.get(t.id)
+        assert t2.metadata == {"priority": "high", "labels": "bug"}, \
+            f"Metadata not persisted: {t2.metadata}"
+    print("PASS: test_metadata_field_roundtrip")
+    return True
+
+
+def test_auto_owner_on_in_progress():
+    """Update task to in_progress without owner, verify owner is auto-set."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tm = TaskManager(Path(tmpdir))
+        tm.create("Ownerless task")
+        updated = tm.update("1", status="in_progress")
+        assert updated.owner != "", \
+            f"Owner should be auto-set when moving to in_progress, got '{updated.owner}'"
+    print("PASS: test_auto_owner_on_in_progress")
+    return True
+
+
+def test_dependency_cleanup_on_complete():
+    """A blocks B, complete A, verify B.blocked_by is empty."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tm = TaskManager(Path(tmpdir))
+        tm.create("Task A")
+        tm.create("Task B")
+        tm.update("2", addBlockedBy=["1"])
+
+        # Before completing A
+        b = tm.get("2")
+        assert "1" in b.blocked_by, "B should be blocked by A"
+
+        # Complete A
+        tm.update("1", status="completed")
+
+        # After completing A
+        b2 = tm.get("2")
+        assert "1" not in b2.blocked_by, "Completing A should remove it from B's blocked_by"
+    print("PASS: test_dependency_cleanup_on_complete")
+    return True
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -418,6 +558,14 @@ if __name__ == "__main__":
         test_v6_agent_loop_integrates_tasks,
         test_v6_tasks_json_persistence_format,
         test_v6_dependency_bidirectional,
+        # v6 new mechanism tests
+        test_highwatermark_persistence,
+        test_resolve_task_list_id_env_var,
+        test_resolve_task_list_id_team_name,
+        test_resolve_task_list_id_default,
+        test_metadata_field_roundtrip,
+        test_auto_owner_on_in_progress,
+        test_dependency_cleanup_on_complete,
         # LLM integration
         test_llm_creates_tasks,
         test_llm_task_then_work,

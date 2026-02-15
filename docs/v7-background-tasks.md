@@ -130,12 +130,14 @@ The notification bus is implemented as a `queue.Queue`. The main agent loop perf
 # 1. Drain: pull all pending notifications from the queue
 notifications = BG.drain_notifications()
 
-# 2. Format: convert to XML blocks
+# 2. Format: convert to XML blocks (6 tags total)
 notif_text = "\n".join(
     f"<task-notification>\n"
     f"  <task-id>{n['task_id']}</task-id>\n"
+    f"  <task-type>{n.get('task_type', 'unknown')}</task-type>\n"
     f"  <status>{n['status']}</status>\n"
-    f"  Summary: {n['summary']}\n"
+    f"  <summary>{n['summary']}</summary>\n"
+    f"  <output-file>{n.get('output_file', '')}</output-file>\n"
     f"</task-notification>"
     for n in notifications
 )
@@ -149,19 +151,57 @@ else:
 
 The model sees notifications as structured XML blocks within its conversation context. It can then decide to retrieve full output via `TaskOutput` or continue with the summary.
 
-## Notification Format
+## Notification XML Protocol
 
-When a background task completes, a notification is automatically injected into the main agent's next turn:
+When a background task completes, a notification is automatically injected into the main agent's next turn. The XML contains 6 tags:
 
 ```xml
 <task-notification>
   <task-id>a3f7c2</task-id>
+  <task-type>local_agent</task-type>
   <status>completed</status>
-  Summary: Found 3 authentication-related files in src/auth/...
+  <summary>Found 3 authentication-related files in src/auth/...</summary>
+  <output-file>.task_outputs/a3f7c2.txt</output-file>
 </task-notification>
 ```
 
-The `summary` field contains the first 500 characters of the task output -- enough for the model to decide whether to fetch the full result.
+| Tag | Purpose |
+|-----|---------|
+| `task-notification` | Wrapper element |
+| `task-id` | Unique ID with type prefix (b/a/t) |
+| `task-type` | `local_bash`, `local_agent`, or `in_process_teammate` |
+| `status` | `completed`, `error`, or `stopped` |
+| `summary` | First 500 chars of output for quick triage |
+| `output-file` | Path to full output on disk |
+
+## Non-Editable Queue Mode
+
+Notification XML blocks are marked as non-editable:
+
+```python
+NON_EDITABLE_MODES = {"task-notification"}
+
+def is_editable(mode: str) -> bool:
+    return mode not in NON_EDITABLE_MODES
+```
+
+This prevents the model from attempting to modify injected notification text. The notifications are read-only structured data, not part of the editable conversation flow.
+
+## Output File System
+
+Background task outputs are saved to disk at `.task_outputs/{task_id}.txt`:
+
+```python
+OUTPUT_DIR = WORKDIR / ".task_outputs"
+
+def _save_output(self, task_id, output):
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    (OUTPUT_DIR / f"{task_id}.txt").write_text(output)
+```
+
+This serves two purposes:
+1. Large outputs do not bloat the notification (only the 500-char summary is injected)
+2. The output persists on disk even after context compression
 
 ## Typical Flow
 
@@ -208,4 +248,4 @@ Background tasks also lay the groundwork for v8 Teammates: a Teammate is essenti
 
 **Serial waiting wastes time. Parallel notification unlocks efficiency.**
 
-[<< v6](./v6-tasks-system.md) | [Back to README](../README.md) | [v8 >>](./v8-teammate-mechanism.md)
+[<< v6](./v6-tasks-system.md) | [Back to README](../README.md) | [v8 >>](./v8-team-messaging.md)

@@ -36,7 +36,8 @@ After completing this tutorial, you will understand:
 - **Context Compression** - How agents work beyond their context window limits
 - **Task Systems** - From personal notes to team project boards
 - **Parallel Execution** - Background tasks and notification-driven workflows
-- **Multi-Agent Collaboration** - Persistent teammates working in parallel
+- **Team Messaging** - Persistent teammates communicating through inboxes
+- **Autonomous Teams** - Self-organizing agents that find and claim their own work
 
 ## Learning Path
 
@@ -48,28 +49,31 @@ Start Here
     |                         16-196 lines
     v
 [v1: Basic Agent] ----------> "The complete agent pattern"
-    |                          4 tools, ~420 lines
+    |                          4 tools, ~417 lines
     v
 [v2: Todo Agent] -----------> "Make plans explicit"
-    |                          +TodoManager, ~530 lines
+    |                          +TodoManager, ~531 lines
     v
 [v3: Subagent] -------------> "Divide and conquer"
-    |                          +Task tool, ~620 lines
+    |                          +Task tool, ~623 lines
     v
 [v4: Skills Agent] ----------> "Domain expertise on-demand"
-    |                           +Skill tool, ~780 lines
+    |                           +Skill tool, ~783 lines
     v
 [v5: Compression Agent] ----> "Never forget, work forever"
-    |                          +ContextManager, ~800 lines
+    |                          +ContextManager, ~896 lines
     v
 [v6: Tasks Agent] ----------> "From sticky notes to kanban"
-    |                          +TaskManager, ~890 lines
+    |                          +TaskManager, ~957 lines
     v
 [v7: Background Agent] -----> "Don't wait, keep working"
-    |                          +BackgroundManager, ~960 lines
+    |                          +BackgroundManager, ~1022 lines
     v
-[v8: Teammate Agent] -------> "A team of agents"
-                               +TeammateManager, ~1330 lines
+[v8: Team Agent] -----------> "Teammates that communicate"
+    |                          +TeammateManager, ~1402 lines
+    v
+[v9: Autonomous Agent] -----> "A self-organizing team"
+                               +Idle cycle, ~1506 lines
 ```
 
 **Recommended approach:**
@@ -81,7 +85,8 @@ Start Here
 6. Study v5 for context management and compression
 7. Explore v6 for persistent task tracking
 8. Understand v7 for parallel background execution
-9. Master v8 for multi-agent team collaboration
+9. Study v8 for team lifecycle and messaging
+10. Master v9 for autonomous multi-agent collaboration
 
 ## Quick Start
 
@@ -106,7 +111,8 @@ python v4_skills_agent.py       # + Skills
 python v5_compression_agent.py  # + Context compression
 python v6_tasks_agent.py        # + Task system
 python v7_background_agent.py   # + Background tasks
-python v8_teammate_agent.py     # + Team collaboration
+python v8_team_agent.py         # + Team messaging
+python v9_autonomous_agent.py  # + Autonomous teams
 ```
 
 ## The Core Pattern
@@ -129,14 +135,15 @@ That's it. The model calls tools until done. Everything else is refinement.
 | Version | Lines | Tools | Core Addition | Key Insight |
 |---------|-------|-------|---------------|-------------|
 | [v0](./v0_bash_agent.py) | ~196 | bash | Recursive subagents | One tool is enough |
-| [v1](./v1_basic_agent.py) | ~420 | bash, read, write, edit | Core loop | Model as Agent |
-| [v2](./v2_todo_agent.py) | ~530 | +TodoWrite | Explicit planning | Constraints enable complexity |
-| [v3](./v3_subagent.py) | ~620 | +Task | Context isolation | Clean context = better results |
-| [v4](./v4_skills_agent.py) | ~780 | +Skill | Knowledge loading | Expertise without retraining |
-| [v5](./v5_compression_agent.py) | ~800 | +ContextManager | 3-layer compression | Forgetting enables infinite work |
-| [v6](./v6_tasks_agent.py) | ~890 | +TaskCreate/Get/Update/List | Persistent tasks | Sticky notes to kanban |
-| [v7](./v7_background_agent.py) | ~960 | +TaskOutput/TaskStop | Background execution | Serial to parallel |
-| [v8](./v8_teammate_agent.py) | ~1330 | +TeamCreate/SendMessage/TeamDelete | Persistent teammates | Command to collaboration |
+| [v1](./v1_basic_agent.py) | ~417 | bash, read, write, edit | Core loop | Model as Agent |
+| [v2](./v2_todo_agent.py) | ~531 | +TodoWrite | Explicit planning | Constraints enable complexity |
+| [v3](./v3_subagent.py) | ~623 | +Task | Context isolation | Clean context = better results |
+| [v4](./v4_skills_agent.py) | ~783 | +Skill | Knowledge loading | Expertise without retraining |
+| [v5](./v5_compression_agent.py) | ~896 | +ContextManager | 3-layer compression | Forgetting enables infinite work |
+| [v6](./v6_tasks_agent.py) | ~957 | +TaskCreate/Get/Update/List | Persistent tasks | Sticky notes to kanban |
+| [v7](./v7_background_agent.py) | ~1022 | +TaskOutput/TaskStop | Background execution | Serial to parallel |
+| [v8](./v8_team_agent.py) | ~1402 | +TeamCreate/SendMessage/TeamDelete | Team messaging | Command to collaboration |
+| [v9](./v9_autonomous_agent.py) | ~1506 | +Idle cycle/auto-claim | Autonomous teams | Collaboration to self-organization |
 
 ## Sub-Mechanism Guide
 
@@ -160,31 +167,33 @@ Each version introduces one core class, but the real learning is in the sub-mech
 | **ID prefix convention** | v7 | `_PREFIXES` | `b`=bash, `a`=agent (v8 adds `t`=teammate) |
 | **Notification bus** | v7 | `drain_notifications()` | Queue drained before each API call |
 | **Notification injection** | v7 | `<task-notification>` XML | Injected into last user message |
-| **Teammate lifecycle** | v8 | `_teammate_loop()` | active -> work -> idle -> check inbox -> active |
+| **Teammate lifecycle** | v8 | `_teammate_loop()` | Work -> check inbox -> exit pattern |
 | **File-based inbox** | v8 | `send_message()/check_inbox()` | JSONL format, per-teammate files |
 | **Message protocol** | v8 | `MESSAGE_TYPES` | 5 types: message, broadcast, shutdown_req/resp, plan_approval |
-| **Tool scoping** | v8 | `TEAMMATE_TOOLS` | Teammates get 8 tools (no TeamCreate/Delete) |
-| **Task claiming** | v8 | `teammate_loop` | Idle teammates auto-claim unclaimed tasks |
-| **Identity preservation** | v8 | `auto_compact` + identity | Teammate name/role re-injected after compression |
+| **Tool scoping** | v8 | `TEAMMATE_TOOLS` | Teammates get 9 tools (no TeamCreate/Delete/Task/Skill) |
+| **Idle cycle** | v9 | `_teammate_loop()` | active -> idle -> poll inbox -> wake -> active |
+| **Task claiming** | v9 | `_teammate_loop()` | Idle teammates auto-claim unclaimed tasks |
+| **Identity preservation** | v9 | `auto_compact` + identity | Teammate name/role re-injected after compression |
 
 ## File Structure
 
 ```
 learn-claude-code/
-├── v0_bash_agent.py          # ~196 lines: 1 tool, recursive subagents
-├── v0_bash_agent_mini.py     # ~16 lines: extreme compression
-├── v1_basic_agent.py         # ~420 lines: 4 tools, core loop
-├── v2_todo_agent.py          # ~530 lines: + TodoManager
-├── v3_subagent.py            # ~620 lines: + Task tool, agent registry
-├── v4_skills_agent.py        # ~780 lines: + Skill tool, SkillLoader
-├── v5_compression_agent.py   # ~800 lines: + ContextManager, 3-layer compression
-├── v6_tasks_agent.py         # ~890 lines: + TaskManager, CRUD with dependencies
-├── v7_background_agent.py    # ~960 lines: + BackgroundManager, parallel execution
-├── v8_teammate_agent.py      # ~1330 lines: + TeammateManager, team collaboration
-├── skills/                   # Example skills (pdf, code-review, mcp-builder, agent-builder)
-├── docs/                     # Technical documentation (EN + ZH + JA)
-├── articles/                 # Blog-style articles (ZH)
-└── tests/                    # Unit, feature, and integration tests
+|-- v0_bash_agent.py          # ~196 lines: 1 tool, recursive subagents
+|-- v0_bash_agent_mini.py     # ~16 lines: extreme compression
+|-- v1_basic_agent.py         # ~417 lines: 4 tools, core loop
+|-- v2_todo_agent.py          # ~531 lines: + TodoManager
+|-- v3_subagent.py            # ~623 lines: + Task tool, agent registry
+|-- v4_skills_agent.py        # ~783 lines: + Skill tool, SkillLoader
+|-- v5_compression_agent.py   # ~896 lines: + ContextManager, 3-layer compression
+|-- v6_tasks_agent.py         # ~957 lines: + TaskManager, CRUD with dependencies
+|-- v7_background_agent.py    # ~1022 lines: + BackgroundManager, parallel execution
+|-- v8_team_agent.py          # ~1402 lines: + TeammateManager, team messaging
+|-- v9_autonomous_agent.py    # ~1506 lines: + Idle cycle, auto-claim, identity preservation
+|-- skills/                   # Example skills (pdf, code-review, mcp-builder, agent-builder)
+|-- docs/                     # Technical documentation (EN + ZH + JA)
+|-- articles/                 # Blog-style articles (ZH)
++-- tests/                    # Unit, feature, and integration tests
 ```
 
 ## Documentation
@@ -199,7 +208,8 @@ learn-claude-code/
 - [v5: Context Compression](./docs/v5-context-compression.md)
 - [v6: Tasks System](./docs/v6-tasks-system.md)
 - [v7: Background Tasks](./docs/v7-background-tasks.md)
-- [v8: Teammate Mechanism](./docs/v8-teammate-mechanism.md)
+- [v8: Team Messaging](./docs/v8-team-messaging.md)
+- [v9: Autonomous Teams](./docs/v9-autonomous-teams.md)
 
 ### Articles
 
